@@ -1,15 +1,18 @@
-"""Music Finder Bot: поиск в Яндекс Музыке / YouTube / SoundCloud, выбор кнопкой -> send_audio."""
+"""Music Finder Bot: поиск в Яндекс Музыке / YouTube Music / SoundCloud, выбор кнопкой, очередь загрузок."""
 import asyncio
+import itertools
 import logging
 import os
 import re
 import shutil
 import tempfile
-from collections import OrderedDict
-from dataclasses import dataclass
+import time
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -19,13 +22,17 @@ log = logging.getLogger("music_finder")
 # FadeHost для Telegram-приложений кладёт токен и в TELEGRAM_BOT_TOKEN
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.environ["TELEGRAM_BOT_TOKEN"]
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN", "").strip()
+# Прокси для YouTube (например, socks5://127.0.0.1:40000) — YouTube блокирует IP серверов
+YT_PROXY = os.getenv("YT_PROXY", "").strip()
 
 MAX_BYTES = 49 * 1024 * 1024   # лимит Bot API на отправку файла — 50 МБ
 MIN_DURATION = 31              # короче — превью SoundCloud Go+
 MAX_DURATION = 15 * 60         # длиннее — фильмы и часовые миксы
-MAX_CHOICES = 6
-# Одновременно качаем не больше N треков — бережём 256 МБ RAM
-DOWNLOADS = asyncio.Semaphore(int(os.getenv("MAX_PARALLEL", "1")))
+PAGE_SIZE = 8
+MAX_RESULTS = 60
+# Сколько треков качается одновременно (каждая загрузка ~50 МБ RAM сверх базовых ~170 МБ)
+WORKERS = int(os.getenv("MAX_PARALLEL", "1"))
+MAX_PER_USER = 5               # треков в очереди на одного пользователя
 
 SOURCE_NAMES = {"ym": "Яндекс Музыка", "yt": "YouTube", "sc": "SoundCloud"}
 
@@ -48,18 +55,36 @@ class Track:
     source: str
 
 
-# Найденные варианты по ключу "source:id" — чтобы по нажатию кнопки знать название трека.
-# Ограничено по размеру; после перезапуска старые кнопки качают по id без запасного поиска.
-_candidates: OrderedDict[str, Candidate] = OrderedDict()
+@dataclass
+class SearchSession:
+    query: str
+    items: list[Candidate]
+    more: str | None = None   # токен следующей страницы YouTube Music
 
 
-def _remember(c: Candidate) -> str:
-    key = f"{c.source}:{c.id}"
-    _candidates[key] = c
-    _candidates.move_to_end(key)
-    while len(_candidates) > 1000:
-        _candidates.popitem(last=False)
-    return key
+@dataclass
+class Job:
+    chat: Message
+    status: Message
+    candidate: Candidate
+    user_id: int
+    key: str
+    text: str = ""            # последний показанный текст статуса
+    progress: dict = field(default_factory=dict)   # пишется из потока yt-dlp
+
+
+# ---------- память поисков (по ним работают кнопки) ----------
+
+_sessions: OrderedDict[str, SearchSession] = OrderedDict()
+_session_ids = itertools.count(1)
+
+
+def _new_session(s: SearchSession) -> str:
+    sid = format(next(_session_ids), "x")
+    _sessions[sid] = s
+    while len(_sessions) > 300:
+        _sessions.popitem(last=False)
+    return sid
 
 
 # ---------- Яндекс Музыка ----------
@@ -85,7 +110,7 @@ async def yandex_search(query: str) -> list[Candidate]:
     return [
         Candidate("ym", str(t.id), ", ".join(t.artists_name()), t.title or "",
                   (t.duration_ms or 0) // 1000 or None)
-        for t in result.tracks.results[:MAX_CHOICES] if t.available
+        for t in result.tracks.results if t.available
     ]
 
 
@@ -102,10 +127,20 @@ async def yandex_download(c: Candidate, workdir: Path) -> Track | None:
 # ---------- YouTube Music: поиск песен напрямую, без ключей ----------
 
 _YTM_URL = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
-_YTM_BODY = {
-    "context": {"client": {"clientName": "WEB_REMIX", "clientVersion": "1.20250101.01.00", "hl": "ru"}},
-    "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA==",  # фильтр «Песни»
-}
+_YTM_CONTEXT = {"client": {"clientName": "WEB_REMIX", "clientVersion": "1.20250101.01.00", "hl": "ru"}}
+_YTM_SONGS = "EgWKAQIIAWoKEAkQBRAKEAMQBA=="  # фильтр «Песни»
+
+
+def _find(obj, key: str):
+    """Все значения ключа `key` на любой глубине JSON."""
+    if isinstance(obj, dict):
+        if key in obj:
+            yield obj[key]
+        for value in obj.values():
+            yield from _find(value, key)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _find(value, key)
 
 
 def _seconds(text: str) -> int:
@@ -115,30 +150,29 @@ def _seconds(text: str) -> int:
     return total
 
 
-async def ytmusic_search(query: str) -> list[Candidate]:
+async def ytmusic_search(query: str, more: str | None = None) -> tuple[list[Candidate], str | None]:
+    """Одна страница (~20 песен) и токен следующей."""
     import aiohttp
 
+    url, body = _YTM_URL, {"context": _YTM_CONTEXT, "query": query, "params": _YTM_SONGS}
+    if more:
+        url, body = f"{_YTM_URL}&ctoken={more}&continuation={more}&type=next", {"context": _YTM_CONTEXT}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        async with session.post(_YTM_URL, json={**_YTM_BODY, "query": query},
-                                headers={"Origin": "https://music.youtube.com"}) as resp:
+        async with session.post(url, json=body, headers={"Origin": "https://music.youtube.com"}) as resp:
             resp.raise_for_status()
             data = await resp.json()
-    tabs = data["contents"]["tabbedSearchResultsRenderer"]["tabs"]
     result = []
-    for section in tabs[0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"]:
-        for item in section.get("musicShelfRenderer", {}).get("contents", []):
-            row = item["musicResponsiveListItemRenderer"]
-            video_id = (row.get("playlistItemData") or {}).get("videoId")
-            title, info = ("".join(r["text"] for r in col["musicResponsiveListItemFlexColumnRenderer"]["text"]
-                                   .get("runs", [])) for col in row["flexColumns"][:2])
-            # info: «Исполнитель • Альбом • 3:45»
-            parts = info.split(" • ")
-            duration = _seconds(parts[-1]) if re.fullmatch(r"[\d:]+", parts[-1]) else 0
-            if video_id and MIN_DURATION < duration < MAX_DURATION:
-                result.append(Candidate("yt", video_id, parts[0], title, duration))
-            if len(result) == MAX_CHOICES:
-                return result
-    return result
+    for row in _find(data, "musicResponsiveListItemRenderer"):
+        video_id = (row.get("playlistItemData") or {}).get("videoId")
+        title, info = ("".join(r["text"] for r in col["musicResponsiveListItemFlexColumnRenderer"]["text"]
+                               .get("runs", [])) for col in row["flexColumns"][:2])
+        # info: «Исполнитель • Альбом • 3:45»
+        parts = info.split(" • ")
+        duration = _seconds(parts[-1]) if re.fullmatch(r"[\d:]+", parts[-1]) else 0
+        if video_id and MIN_DURATION < duration < MAX_DURATION:
+            result.append(Candidate("yt", video_id, parts[0], title, duration))
+    token = next(_find(data, "nextContinuationData"), {}).get("continuation")
+    return result, token
 
 
 # ---------- YouTube / SoundCloud через yt-dlp ----------
@@ -150,30 +184,12 @@ _YTDLP_BASE = {
     # Без JS-рантайма: deno/node вместе с aiogram не влезают в 256 МБ (OOM)
     "js_runtimes": {},
 }
-_IE_KEYS = {"yt": "Youtube", "sc": "Soundcloud"}
-_SEARCH = {"yt": "ytsearch12", "sc": "scsearch12"}  # YouTube ищем через YouTube Music, здесь — запасной путь
 _URLS = {"yt": "https://www.youtube.com/watch?v={}", "sc": "https://api.soundcloud.com/tracks/{}"}
-
-
-def _ytdlp_search(source: str, query: str) -> list[Candidate]:
-    import yt_dlp  # тяжёлый модуль — грузим только когда он реально нужен
-
-    with yt_dlp.YoutubeDL({**_YTDLP_BASE, "extract_flat": "in_playlist"}) as ydl:
-        found = ydl.extract_info(f"{_SEARCH[source]}:{query}", download=False)
-    result = []
-    for e in (found or {}).get("entries") or []:
-        duration = int(e.get("duration") or 0)
-        # в выдаче бывают каналы, плейлисты, фильмы и шортсы — их пропускаем
-        if e.get("ie_key") != _IE_KEYS[source] or not MIN_DURATION < duration < MAX_DURATION:
-            continue
-        performer, title = _split_title(e.get("title") or "", e.get("channel") or e.get("uploader") or "")
-        result.append(Candidate(source, str(e["id"]), performer, title, duration))
-        if len(result) == MAX_CHOICES:
-            break
-    return result
-
-
 _JUNK = re.compile(r"\s*[(\[][^)\]]*(official|video|клип|lyric|audio|visuali[sz]er|премьера|hd|4k)[^)\]]*[)\]]", re.I)
+# Признаки «не оригинала» — такие загрузки SoundCloud не берём, если их нет в названии самого трека
+_NOT_ORIGINAL = re.compile(
+    r"remix|rmx|cover|slowed|sped|speed\s?up|nightcore|karaoke|instrumental|acapella|minus|"
+    r"bass\s?boost|8d|reverb|mashup|bootleg|flip|live|ремикс|кавер|минус|караоке|концерт|акустик", re.I)
 
 
 def _split_title(title: str, uploader: str) -> tuple[str, str]:
@@ -185,8 +201,31 @@ def _split_title(title: str, uploader: str) -> tuple[str, str]:
     return uploader, title
 
 
-def _ytdlp_download(c: Candidate, workdir: Path) -> Track | None:
+def _soundcloud_search(query: str, limit: int) -> list[Candidate]:
+    import yt_dlp  # тяжёлый модуль — грузим только когда он реально нужен
+
+    with yt_dlp.YoutubeDL({**_YTDLP_BASE, "extract_flat": "in_playlist"}) as ydl:
+        found = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+    result = []
+    for e in (found or {}).get("entries") or []:
+        duration = int(e.get("duration") or 0)
+        if e.get("ie_key") != "Soundcloud" or not MIN_DURATION < duration < MAX_DURATION:
+            continue
+        performer, title = _split_title(e.get("title") or "", e.get("uploader") or "")
+        result.append(Candidate("sc", str(e["id"]), performer, title, duration))
+    return result
+
+
+def _ytdlp_download(c: Candidate, workdir: Path, progress: dict) -> Track | None:
     import yt_dlp
+
+    def hook(d: dict) -> None:
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total:
+                progress["pct"] = d.get("downloaded_bytes", 0) / total
+            elif d.get("fragment_count"):  # HLS у SoundCloud
+                progress["pct"] = (d.get("fragment_index") or 0) / d["fragment_count"]
 
     opts = {
         **_YTDLP_BASE,
@@ -195,9 +234,12 @@ def _ytdlp_download(c: Candidate, workdir: Path) -> Track | None:
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "max_filesize": MAX_BYTES,
+        "progress_hooks": [hook],
         # AAC из m4a копируется без перекодирования, opus/webm ffmpeg перегоняет в m4a
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}],
     }
+    if c.source == "yt" and YT_PROXY:
+        opts["proxy"] = YT_PROXY
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             entry = ydl.extract_info(_URLS[c.source].format(c.id), download=True)
@@ -216,47 +258,147 @@ def _ytdlp_download(c: Candidate, workdir: Path) -> Track | None:
     )
 
 
+def _same_track(original: Candidate, alt: Candidate) -> int | None:
+    """Насколько загрузка SoundCloud похожа на оригинал: меньше — лучше, None — точно не он."""
+    if _NOT_ORIGINAL.search(f"{alt.performer} {alt.title}") and not _NOT_ORIGINAL.search(original.title):
+        return None
+    text = f"{alt.performer} {alt.title}".lower()
+    for part in (original.title, original.performer):  # и название, и исполнитель должны совпасть
+        words = {w for w in re.findall(r"\w+", part.lower()) if len(w) > 2} or {part.lower()}
+        if part and not any(w in text for w in words):
+            return None
+    diff = abs((alt.duration or 0) - (original.duration or 0)) if original.duration else 0
+    return diff if diff <= 15 else None
+
+
 # ---------- общий поиск и загрузка ----------
 
-async def search_candidates(query: str) -> list[Candidate]:
+async def search(query: str) -> SearchSession:
     try:
         if found := await yandex_search(query):
-            return found
+            return SearchSession(query, found)
     except Exception:
         log.exception("Yandex Music search failed for %r", query)
     try:
-        if found := await ytmusic_search(query):
-            return found
+        found, more = await ytmusic_search(query)
+        if found:
+            return SearchSession(query, found, more)
     except Exception:
         log.exception("YouTube Music search failed for %r", query)
     try:
-        return await asyncio.to_thread(_ytdlp_search, "sc", query)
+        return SearchSession(query, await asyncio.to_thread(_soundcloud_search, query, 40))
     except Exception:
         log.exception("SoundCloud search failed for %r", query)
-        return []
+        return SearchSession(query, [])
 
 
-async def download(c: Candidate, workdir: Path) -> Track | None:
+async def download(job: Job, workdir: Path) -> Track | None:
+    c = job.candidate
     try:
         if c.source == "ym":
             track = await yandex_download(c, workdir)
         else:
-            track = await asyncio.to_thread(_ytdlp_download, c, workdir)
+            track = await asyncio.to_thread(_ytdlp_download, c, workdir, job.progress)
         if track:
             return track
     except Exception:
         log.exception("Download failed for %s:%s", c.source, c.id)
     if c.source == "sc" or not c.title:
         return None
-    # YouTube блокирует IP хостингов («Sign in to confirm you're not a bot») — ищем то же на SoundCloud
-    query = f"{c.performer} {c.title}" if c.performer.lower() not in c.title.lower() else c.title
-    alts = await asyncio.to_thread(_ytdlp_search, "sc", query)
-    if c.duration:  # сначала загрузки той же длины — скорее всего это тот же трек, а не ремикс
-        alts.sort(key=lambda a: abs((a.duration or 0) - c.duration) > 5)
-    for alt in alts:
-        if track := await asyncio.to_thread(_ytdlp_download, alt, workdir):
+    # YouTube блокирует IP серверов («Sign in to confirm you're not a bot») — ищем тот же трек на SoundCloud
+    job.progress.update(stage="🔁 YouTube не отдал файл, ищу этот трек на SoundCloud…", pct=None)
+    alts = await asyncio.to_thread(_soundcloud_search, f"{c.performer} {c.title}", 12)
+    scored = sorted((score, i, alt) for i, alt in enumerate(alts) if (score := _same_track(c, alt)) is not None)
+    for _, _, alt in scored[:4]:
+        job.progress.update(stage="⬇️ Скачиваю с SoundCloud", pct=0.0)
+        if track := await asyncio.to_thread(_ytdlp_download, alt, workdir, job.progress):
             return track
     return None
+
+
+# ---------- очередь загрузок ----------
+
+_queue: asyncio.Queue[Job] = asyncio.Queue()
+_waiting: deque[Job] = deque()     # стоят в очереди, ещё не начались
+_active: set[str] = set()          # ключи "user:трек" в очереди и в работе — от повторных нажатий
+
+
+def _bar(pct: float) -> str:
+    filled = round(pct * 10)
+    return "▰" * filled + "▱" * (10 - filled) + f" {pct:.0%}"
+
+
+async def _set_status(job: Job, text: str) -> None:
+    if text == job.text:
+        return
+    job.text = text
+    try:
+        await job.status.edit_text(text)
+    except TelegramBadRequest:
+        pass  # «message is not modified» или сообщение удалили
+
+
+async def _refresh_queue_positions() -> None:
+    for position, job in enumerate(list(_waiting), start=1):
+        await _set_status(job, f"🕐 В очереди: {position}-й\n<b>{_escape(_label(job.candidate))}</b>")
+
+
+async def _show_progress(job: Job) -> None:
+    """Раз в 1.5 сек переносит прогресс из потока загрузки в сообщение."""
+    name = f"<b>{_escape(_label(job.candidate))}</b>"
+    while True:
+        stage = job.progress.get("stage", "⬇️ Скачиваю")
+        pct = job.progress.get("pct")
+        await _set_status(job, f"{stage}\n{name}" + (f"\n{_bar(pct)}" if pct is not None else ""))
+        await asyncio.sleep(1.5)
+
+
+async def worker() -> None:
+    while True:
+        job = await _queue.get()
+        _waiting.remove(job)
+        asyncio.create_task(_refresh_queue_positions())
+        try:
+            await process(job)
+        except Exception:
+            log.exception("Job failed: %s", job.key)
+        finally:
+            _active.discard(job.key)
+
+
+async def process(job: Job) -> None:
+    workdir = Path(tempfile.mkdtemp(prefix="mf_"))
+    job.progress.update(stage="⬇️ Скачиваю", pct=0.0 if job.candidate.source != "ym" else None)
+    ticker = asyncio.create_task(_show_progress(job))
+    try:
+        started = time.monotonic()
+        track = await download(job, workdir)
+        if not track:
+            ticker.cancel()
+            await _set_status(job, f"😔 Не удалось скачать оригинал:\n<b>{_escape(_label(job.candidate))}</b>\n"
+                                   "Попробуй другой вариант из списка.")
+            return
+        if track.path.stat().st_size > MAX_BYTES:
+            ticker.cancel()
+            await _set_status(job, "Файл больше 50 МБ — Telegram не даст его отправить.")
+            return
+        job.progress.update(stage="📤 Отправляю в Telegram", pct=None)
+        await job.chat.answer_audio(
+            FSInputFile(track.path, filename=_filename(track)),
+            title=track.title,
+            performer=track.performer,
+            duration=track.duration,
+            caption=f"Источник: {track.source}",
+        )
+        ticker.cancel()
+        await job.status.delete()
+        log.info("Sent %s in %.0fs from %s", job.key, time.monotonic() - started, track.source)
+    except Exception:
+        ticker.cancel()
+        log.exception("Failed to send %s", job.key)
+        await _set_status(job, "⚠️ Ошибка при загрузке, попробуй ещё раз.")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)  # файл удаляется сразу после отправки
 
 
 # ---------- Telegram ----------
@@ -268,61 +410,103 @@ dp = Dispatcher()
 async def start(message: Message) -> None:
     await message.answer(
         "Напиши исполнителя и/или название трека, например:\n<code>Кино Группа крови</code>\n\n"
-        "Если вариантов несколько — выбери нужный кнопкой."
+        "Выбери нужный вариант кнопкой — можно несколько, они встанут в очередь."
     )
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
-async def search(message: Message) -> None:
+async def on_query(message: Message) -> None:
     query = message.text.strip()[:200]
     status = await message.answer(f"🔎 Ищу: <b>{_escape(query)}</b>…")
-    found = await search_candidates(query)
-    if not found:
+    session = await search(query)
+    if not session.items:
         await status.edit_text("😔 Ничего не нашёл. Попробуй уточнить запрос.")
         return
-    if len(found) == 1:
-        await status.edit_text(f"⏳ Качаю: <b>{_escape(_label(found[0]))}</b>…")
-        await send_track(message, status, found[0])
+    sid = _new_session(session)
+    if len(session.items) == 1:
+        await status.edit_text(f"Нашёл: <b>{_escape(_label(session.items[0]))}</b>")
+        await enqueue(message, message.from_user.id, sid, 0)
         return
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=_label(c, with_duration=True), callback_data=_remember(c))] for c in found
-    ])
-    await status.edit_text(f"Что нашлось по запросу <b>{_escape(query)}</b>:", reply_markup=keyboard)
+    await status.edit_text(_page_text(session), reply_markup=_page_keyboard(sid, session, 0))
 
 
-@dp.callback_query(F.data.regexp(r"^(ym|yt|sc):[\w-]+$"))
-async def choose(callback: CallbackQuery) -> None:
-    source, _, track_id = callback.data.partition(":")
-    c = _candidates.get(callback.data) or Candidate(source, track_id, "", "", None)
-    await callback.answer("Качаю…")
-    status = await callback.message.answer(f"⏳ Качаю: <b>{_escape(_label(c) or 'трек')}</b>…")
-    await send_track(callback.message, status, c)
-
-
-async def send_track(chat: Message, status: Message, c: Candidate) -> None:
-    workdir = Path(tempfile.mkdtemp(prefix="mf_"))
+@dp.callback_query(F.data.startswith("p:"))
+async def on_page(callback: CallbackQuery) -> None:
+    _, sid, page = callback.data.split(":")
+    session, page = _sessions.get(sid), int(page)
+    if not session:
+        await callback.answer("Поиск устарел — отправь запрос заново", show_alert=True)
+        return
+    # листаем дальше загруженного — догружаем следующую страницу YouTube Music
+    if (page + 1) * PAGE_SIZE > len(session.items) and session.more and len(session.items) < MAX_RESULTS:
+        try:
+            found, session.more = await ytmusic_search(session.query, session.more)
+            session.items.extend(found)
+        except Exception:
+            log.exception("YouTube Music next page failed for %r", session.query)
+            session.more = None
+    await callback.answer()
     try:
-        async with DOWNLOADS:
-            track = await download(c, workdir)
-        if not track:
-            await status.edit_text("😔 Этот трек скачать не получилось. Выбери другой вариант.")
-            return
-        if track.path.stat().st_size > MAX_BYTES:
-            await status.edit_text("Файл больше 50 МБ — Telegram не даст его отправить.")
-            return
-        await chat.answer_audio(
-            FSInputFile(track.path, filename=_filename(track)),
-            title=track.title,
-            performer=track.performer,
-            duration=track.duration,
-            caption=f"Источник: {track.source}",
-        )
-        await status.delete()
-    except Exception:
-        log.exception("Failed to send %s:%s", c.source, c.id)
-        await status.edit_text("⚠️ Ошибка при загрузке, попробуй ещё раз.")
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)  # файл удаляется сразу после отправки
+        await callback.message.edit_text(_page_text(session), reply_markup=_page_keyboard(sid, session, page))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("d:"))
+async def on_choose(callback: CallbackQuery) -> None:
+    _, sid, index = callback.data.split(":")
+    if sid not in _sessions:
+        await callback.answer("Поиск устарел — отправь запрос заново", show_alert=True)
+        return
+    await enqueue(callback.message, callback.from_user.id, sid, int(index), callback)
+
+
+@dp.callback_query(F.data == "noop")
+async def on_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+async def enqueue(chat: Message, user_id: int, sid: str, index: int, callback: CallbackQuery | None = None) -> None:
+    c = _sessions[sid].items[index]
+    key = f"{user_id}:{c.source}:{c.id}"
+
+    async def reply(text: str, alert: bool = False) -> None:
+        if callback:
+            await callback.answer(text, show_alert=alert)
+
+    if key in _active:
+        await reply("Этот трек уже в очереди")
+        return
+    if sum(k.startswith(f"{user_id}:") for k in _active) >= MAX_PER_USER:
+        await reply(f"В очереди уже {MAX_PER_USER} твоих трека — дождись, пока скачаются", alert=True)
+        return
+    await reply("Добавил в очередь")
+    _active.add(key)
+    job = Job(chat, await chat.answer("🕐 В очереди…"), c, user_id, key)
+    _waiting.append(job)
+    await _refresh_queue_positions()
+    _queue.put_nowait(job)
+
+
+def _page_text(session: SearchSession) -> str:
+    return f"Что нашлось по запросу <b>{_escape(session.query)}</b> — выбери трек:"
+
+
+def _page_keyboard(sid: str, session: SearchSession, page: int) -> InlineKeyboardMarkup:
+    start = page * PAGE_SIZE
+    rows = [
+        [InlineKeyboardButton(text=_label(c, with_duration=True), callback_data=f"d:{sid}:{i}")]
+        for i, c in enumerate(session.items[start:start + PAGE_SIZE], start=start)
+    ]
+    has_next = start + PAGE_SIZE < len(session.items) or (session.more and len(session.items) < MAX_RESULTS)
+    nav = [
+        InlineKeyboardButton(text="◀️", callback_data=f"p:{sid}:{page - 1}") if page else None,
+        InlineKeyboardButton(text=f"стр. {page + 1}", callback_data="noop"),
+        InlineKeyboardButton(text="▶️", callback_data=f"p:{sid}:{page + 1}") if has_next else None,
+    ]
+    if page or has_next:
+        rows.append([b for b in nav if b])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _label(c: Candidate, with_duration: bool = False) -> str:
@@ -346,11 +530,14 @@ async def main() -> None:
 
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     if not YANDEX_TOKEN:
-        log.warning("YANDEX_TOKEN не задан — ищу только на YouTube и SoundCloud")
+        log.warning("YANDEX_TOKEN не задан — ищу только на YouTube Music и SoundCloud")
+    workers = [asyncio.create_task(worker()) for _ in range(WORKERS)]
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
+        for w in workers:
+            w.cancel()
         await bot.session.close()
 
 
