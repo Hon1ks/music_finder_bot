@@ -59,7 +59,6 @@ class Track:
 class SearchSession:
     query: str
     items: list[Candidate]
-    more: str | None = None   # токен следующей страницы YouTube Music
 
 
 @dataclass
@@ -280,9 +279,15 @@ async def search(query: str) -> SearchSession:
     except Exception:
         log.exception("Yandex Music search failed for %r", query)
     try:
+        # грузим все страницы сразу (до MAX_RESULTS) — чтобы показать «стр. 2 / 8»
         found, more = await ytmusic_search(query)
+        while more and len(found) < MAX_RESULTS:
+            page, more = await ytmusic_search(query, more)
+            if not page:
+                break
+            found += page
         if found:
-            return SearchSession(query, found, more)
+            return SearchSession(query, found[:MAX_RESULTS])
     except Exception:
         log.exception("YouTube Music search failed for %r", query)
     try:
@@ -437,14 +442,6 @@ async def on_page(callback: CallbackQuery) -> None:
     if not session:
         await callback.answer("Поиск устарел — отправь запрос заново", show_alert=True)
         return
-    # листаем дальше загруженного — догружаем следующую страницу YouTube Music
-    if (page + 1) * PAGE_SIZE > len(session.items) and session.more and len(session.items) < MAX_RESULTS:
-        try:
-            found, session.more = await ytmusic_search(session.query, session.more)
-            session.items.extend(found)
-        except Exception:
-            log.exception("YouTube Music next page failed for %r", session.query)
-            session.more = None
     await callback.answer()
     try:
         await callback.message.edit_text(_page_text(session), reply_markup=_page_keyboard(sid, session, page))
@@ -489,7 +486,7 @@ async def enqueue(chat: Message, user_id: int, sid: str, index: int, callback: C
 
 
 def _page_text(session: SearchSession) -> str:
-    return f"Что нашлось по запросу <b>{_escape(session.query)}</b> — выбери трек:"
+    return f"Что нашлось по запросу <b>{_escape(session.query)}</b> ({len(session.items)} шт.) — выбери трек:"
 
 
 def _page_keyboard(sid: str, session: SearchSession, page: int) -> InlineKeyboardMarkup:
@@ -498,13 +495,13 @@ def _page_keyboard(sid: str, session: SearchSession, page: int) -> InlineKeyboar
         [InlineKeyboardButton(text=_label(c, with_duration=True), callback_data=f"d:{sid}:{i}")]
         for i, c in enumerate(session.items[start:start + PAGE_SIZE], start=start)
     ]
-    has_next = start + PAGE_SIZE < len(session.items) or (session.more and len(session.items) < MAX_RESULTS)
+    pages = -(-len(session.items) // PAGE_SIZE)
     nav = [
         InlineKeyboardButton(text="◀️", callback_data=f"p:{sid}:{page - 1}") if page else None,
-        InlineKeyboardButton(text=f"стр. {page + 1}", callback_data="noop"),
-        InlineKeyboardButton(text="▶️", callback_data=f"p:{sid}:{page + 1}") if has_next else None,
+        InlineKeyboardButton(text=f"стр. {page + 1} / {pages}", callback_data="noop"),
+        InlineKeyboardButton(text="▶️", callback_data=f"p:{sid}:{page + 1}") if page + 1 < pages else None,
     ]
-    if page or has_next:
+    if pages > 1:
         rows.append([b for b in nav if b])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
