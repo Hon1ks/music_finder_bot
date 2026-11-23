@@ -65,42 +65,50 @@ async def from_yandex(query: str, workdir: Path) -> Track | None:
     )
 
 
-def _youtube_download(query: str, workdir: Path) -> Track | None:
+def _ytdlp_download(search: str, query: str, workdir: Path, source: str) -> Track | None:
+    """Ищет `search:query`, качает первый результат, который удалось скачать."""
     import yt_dlp  # тяжёлый модуль — грузим только когда он реально нужен
 
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        # превью SoundCloud Go+ (30 сек) не берём
+        "format": "bestaudio[ext=m4a][format_id!*=preview]/bestaudio[format_id!*=preview]",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "max_filesize": MAX_BYTES,
-        "match_filter": yt_dlp.utils.match_filter_func(f"duration < {MAX_DURATION}"),
+        "match_filter": yt_dlp.utils.match_filter_func(f"duration < {MAX_DURATION} & duration > 31"),
         # Без JS-рантайма: deno/node вместе с aiogram не влезают в 256 МБ (OOM)
         "js_runtimes": {},
         # AAC из m4a копируется без перекодирования, opus/webm ffmpeg перегоняет в m4a
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}],
     }
+    with yt_dlp.YoutubeDL({**opts, "extract_flat": "in_playlist"}) as ydl:
+        found = ydl.extract_info(f"{search}:{query}", download=False)
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-    entries = (info or {}).get("entries") or []
-    if not entries or not entries[0]:
-        return None
-    entry = entries[0]
-    files = [p for p in workdir.iterdir() if p.suffix in (".mp3", ".m4a")]
-    if not files:
-        return None
-    return Track(
-        path=files[0],
-        title=entry.get("track") or entry.get("title") or query,
-        performer=entry.get("artist") or entry.get("uploader") or "",
-        duration=int(entry["duration"]) if entry.get("duration") else None,
-        source="YouTube",
-    )
+        for item in (found or {}).get("entries") or []:
+            if item.get("ie_key") not in ("Youtube", "Soundcloud"):
+                continue  # в выдаче бывают каналы и плейлисты — их не качаем
+            try:
+                entry = ydl.extract_info(item["url"], download=True)
+            except yt_dlp.utils.DownloadError as e:  # DRM, бот-проверка, нет формата
+                log.info("%s skip %s: %s", source, item.get("url"), str(e)[:150])
+                continue
+            files = [p for p in workdir.iterdir() if p.suffix in (".mp3", ".m4a")]
+            if not entry or not files:
+                continue  # отсеян match_filter
+            return Track(
+                path=files[0],
+                title=entry.get("track") or entry.get("title") or query,
+                performer=entry.get("artist") or entry.get("uploader") or "",
+                duration=int(entry["duration"]) if entry.get("duration") else None,
+                source=source,
+            )
+    return None
 
 
-async def from_youtube(query: str, workdir: Path) -> Track | None:
-    return await asyncio.to_thread(_youtube_download, query, workdir)
+# YouTube блокирует IP хостингов («Sign in to confirm you're not a bot»), SoundCloud — нет
+SOURCES = (("ytsearch2", "YouTube"), ("scsearch5", "SoundCloud"))
 
 
 async def find_track(query: str, workdir: Path) -> Track | None:
@@ -110,11 +118,14 @@ async def find_track(query: str, workdir: Path) -> Track | None:
             return track
     except Exception:
         log.exception("Yandex Music failed for %r", query)
-    try:
-        return await from_youtube(query, workdir)
-    except Exception:
-        log.exception("YouTube failed for %r", query)
-        return None
+    for search, source in SOURCES:
+        try:
+            track = await asyncio.to_thread(_ytdlp_download, search, query, workdir, source)
+            if track:
+                return track
+        except Exception:
+            log.exception("%s failed for %r", source, query)
+    return None
 
 
 dp = Dispatcher()
